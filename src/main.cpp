@@ -4,8 +4,7 @@
 #include <GxEPD2_BW.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMonoBold18pt7b.h>
-#include "line_art/face.h"
-#include "line_art/giraffe.h"
+#include "images.h"
 
 // Encoder 1 pins
 #define ROTARY1_A_PIN 32
@@ -301,7 +300,8 @@ unsigned long lastUpdate = 0;
 
 void renderScreen()
 {
-  drawBitmapToBuffer(drawingBuffer, DISPLAY_WIDTH, DISPLAY_HEIGHT, face_image_bytes, 0, 0, 300, 300);
+  // drawBitmapToBuffer(drawingBuffer, DISPLAY_WIDTH, DISPLAY_HEIGHT, face_image_bytes, 0, 0, 300, 300);
+  drawBitmapToBuffer(drawingBuffer, DISPLAY_WIDTH, DISPLAY_HEIGHT, giraffe_image_bytes, 0, 0, 400, 300);
 
   display.firstPage();
   display.setPartialWindow(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
