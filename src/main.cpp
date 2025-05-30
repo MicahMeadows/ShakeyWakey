@@ -25,9 +25,6 @@ GxEPD2_BW<GxEPD2_420_GYE042A87, GxEPD2_420_GYE042A87::HEIGHT> display(GxEPD2_420
 
 RTC_DS3231 rtc;
 
-volatile bool updateRtcFromEncoder1 = false;
-volatile bool updateRtcFromEncoder2 = false;
-
 // Create encoder objects
 AiEsp32RotaryEncoder rotaryEncoder1(ROTARY1_A_PIN, ROTARY1_B_PIN, ROTARY1_BUTTON_PIN, ROTARY1_VCC_PIN, ROTARY1_STEPS);
 AiEsp32RotaryEncoder rotaryEncoder2(ROTARY2_A_PIN, ROTARY2_B_PIN, ROTARY2_BUTTON_PIN, ROTARY2_VCC_PIN, ROTARY2_STEPS);
@@ -35,73 +32,56 @@ AiEsp32RotaryEncoder rotaryEncoder2(ROTARY2_A_PIN, ROTARY2_B_PIN, ROTARY2_BUTTON
 void IRAM_ATTR readEncoderISR1()
 {
   rotaryEncoder1.readEncoder_ISR();
-  updateRtcFromEncoder1 = true;
 }
 
 void IRAM_ATTR readEncoderISR2()
 {
   rotaryEncoder2.readEncoder_ISR();
-  updateRtcFromEncoder2 = true;
 }
 
-void rotary_onButtonClick1()
+int encoder1Val = 0;
+int encoder2Val = 0;
+bool setClockMode = true;
+
+DateTime clockTime(__DATE__, __TIME__);
+
+void updateTime(int dHours, int dMinutes)
 {
-  static unsigned long lastTimePressed = 0;
-  if (millis() - lastTimePressed < 500) return;
-  lastTimePressed = millis();
-  Serial.print("Encoder 1 button pressed at ");
-  Serial.print(millis());
-  Serial.println(" ms");
+  DateTime now = rtc.now();
+  int newHour = (now.hour() + dHours) % 24;
+  if (newHour < 0) newHour += 24;
+
+  int newMinute = (now.minute() + dMinutes) % 60;
+  if (newMinute < 0) newMinute += 60;
+
+  rtc.adjust(DateTime(now.year(), now.month(), now.day(), newHour, newMinute, now.second()));
+  Serial.printf("RTC updated to: %02d:%02d\n", newHour, newMinute);
+  clockTime = rtc.now();
 }
 
-void rotary_onButtonClick2()
+void checkEncoders()
 {
-  static unsigned long lastTimePressed = 0;
-  if (millis() - lastTimePressed < 500) return;
-  lastTimePressed = millis();
-  Serial.print("Encoder 2 button pressed at ");
-  Serial.print(millis());
-  Serial.println(" ms");
-}
-
-int lastEncoder1Val = 0;
-int lastEncoder2Val = 0;
-
-void rotary_loop()
-{
-  // Encoder 1: Hours
-  if (rotaryEncoder1.encoderChanged())
+  if (rotaryEncoder1.encoderChanged()) 
   {
-    int newVal = rotaryEncoder1.readEncoder();
-    int delta = newVal - lastEncoder1Val;
-    lastEncoder1Val = newVal;
+    const long oldVal = encoder1Val;
+    encoder1Val = rotaryEncoder1.readEncoder();
 
-    DateTime now = rtc.now();
-    int newHour = (now.hour() + delta) % 24;
-    if (newHour < 0) newHour += 24;
-    rtc.adjust(DateTime(now.year(), now.month(), now.day(), newHour, now.minute(), now.second()));
-    Serial.printf("RTC hour updated to: %02d\n", newHour);
+    const long delta = encoder1Val - oldVal;
+    printf("Encoder 1 value: %d | delta: %d \n", encoder1Val, delta);
+
+    updateTime(delta, 0);
   }
 
-  if (rotaryEncoder1.isEncoderButtonClicked())
-    rotary_onButtonClick1();
-
-  // Encoder 2: Minutes
-  if (rotaryEncoder2.encoderChanged())
+  if (rotaryEncoder2.encoderChanged()) 
   {
-    int newVal = rotaryEncoder2.readEncoder();
-    int delta = newVal - lastEncoder2Val;
-    lastEncoder2Val = newVal;
+    const long oldVal = encoder2Val;
+    encoder2Val = rotaryEncoder2.readEncoder();
 
-    DateTime now = rtc.now();
-    int newMinute = (now.minute() + delta) % 60;
-    if (newMinute < 0) newMinute += 60;
-    rtc.adjust(DateTime(now.year(), now.month(), now.day(), now.hour(), newMinute, now.second()));
-    Serial.printf("RTC minute updated to: %02d\n", newMinute);
+    const long delta = encoder2Val - oldVal;
+    printf("Encoder 2 value: %d | delta: %d \n", encoder2Val, delta);
+
+    updateTime(0, delta);
   }
-
-  if (rotaryEncoder2.isEncoderButtonClicked())
-    rotary_onButtonClick2();
 }
 
 
@@ -111,21 +91,24 @@ void setup()
 
   rtc.begin();
 
+  clockTime = rtc.now();
+
   if (rtc.lostPower()) {
     Serial.println("RTC not running!");
-    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    rtc.adjust(clockTime);
   }
+
 
   // Initialize Encoder 1
   rotaryEncoder1.begin();
+  rotaryEncoder1.setEncoderValue(0);
   rotaryEncoder1.setup(readEncoderISR1);
-  rotaryEncoder1.setBoundaries(0, 23, true);
   rotaryEncoder1.setAcceleration(0);
 
   // Initialize Encoder 2
   rotaryEncoder2.begin();
+  rotaryEncoder2.setEncoderValue(0);
   rotaryEncoder2.setup(readEncoderISR2);
-  rotaryEncoder2.setBoundaries(0, 59, true);
   rotaryEncoder2.setAcceleration(0);
 
   display.init(115200, true, 2, false);
@@ -142,9 +125,47 @@ void setup()
 
 unsigned long lastUpdate = 0;
 
+void renderScreen()
+{
+  // Get current RTC time
+  DateTime now = rtc.now();
+  int hours = now.hour();
+  int minutes = now.minute();
+
+  // Format HH:MM
+  char timeStr[6];
+  snprintf(timeStr, sizeof(timeStr), "%02d:%02d", hours, minutes);
+
+  // Calculate text bounds
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.setFont(&FreeMonoBold18pt7b);
+  display.getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
+
+  // Center text on 400x300 screen
+  int16_t x = (400 - w) / 2;
+  int16_t y = (300 + h) / 2;
+
+  // Define a partial window with padding
+  int16_t pad = 10;
+  int16_t pw = w + pad * 2;
+  int16_t ph = h + pad * 2;
+  int16_t px = x - pad;
+  int16_t py = y - h - pad;
+
+  // Draw to e-ink screen
+  display.setPartialWindow(px, py, pw, ph);
+  display.firstPage();
+  do {
+    display.fillRect(px, py, pw, ph, GxEPD_WHITE);
+    display.setCursor(x, y);
+    display.print(timeStr);
+  } while (display.nextPage());
+}
+
 void loop()
 {
-  rotary_loop();
+  checkEncoders();
   delay(50);  // For encoder responsiveness
 
   unsigned long currentMillis = millis();
@@ -152,42 +173,6 @@ void loop()
   if (currentMillis - lastUpdate >= 1000) {
     lastUpdate = currentMillis;
 
-    // Get current RTC time
-    DateTime now = rtc.now();
-    int hours = now.hour();
-    int minutes = now.minute();
-
-    // Format HH:MM
-    char timeStr[6];
-    snprintf(timeStr, sizeof(timeStr), "%02d:%02d", hours, minutes);
-
-    // Calculate text bounds
-    int16_t x1, y1;
-    uint16_t w, h;
-    display.setFont(&FreeMonoBold18pt7b);
-    display.getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
-
-    // Center text on 400x300 screen
-    int16_t x = (400 - w) / 2;
-    int16_t y = (300 + h) / 2;
-
-    // Define a partial window with padding
-    int16_t pad = 10;
-    int16_t pw = w + pad * 2;
-    int16_t ph = h + pad * 2;
-    int16_t px = x - pad;
-    int16_t py = y - h - pad;
-
-    // Draw to e-ink screen
-    display.setPartialWindow(px, py, pw, ph);
-    display.firstPage();
-    do {
-      display.fillRect(px, py, pw, ph, GxEPD_WHITE);
-      display.setCursor(x, y);
-      display.print(timeStr);
-    } while (display.nextPage());
-
-    // Optional: Serial print
-    Serial.println(timeStr);
+    renderScreen();
   }
 }
