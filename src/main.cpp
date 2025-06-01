@@ -24,6 +24,7 @@
 #define DISPLAY_WIDTH 400
 #define BUFFER_SIZE (DISPLAY_WIDTH * DISPLAY_HEIGHT / 8)
 uint8_t drawingBuffer[BUFFER_SIZE] = {0};
+uint8_t copyBuffer[BUFFER_SIZE] = {0};
 
 uint16_t mouseX = DISPLAY_WIDTH / 2;
 uint16_t mouseY = DISPLAY_HEIGHT / 2;
@@ -135,6 +136,13 @@ void drawPixel(int x, int y) {
   drawingBuffer[byteIndex] |= (1 << bitIndex);
 }
 
+void clearPixel(int x, int y) {
+  if (x < 0 || x >= DISPLAY_WIDTH || y < 0 || y >= DISPLAY_HEIGHT) return;
+  int byteIndex = (y * DISPLAY_WIDTH + x) / 8;
+  int bitIndex = 7 - (x % 8);
+  drawingBuffer[byteIndex] &= ~(1 << bitIndex); // Clear the bit
+}
+
 void drawLine(int x0, int y0, int x1, int y1) {
   int dx = abs(x1 - x0);
   int dy = abs(y1 - y0);
@@ -155,6 +163,8 @@ void drawLine(int x0, int y0, int x1, int y1) {
       y0 += sy;
     }
   }
+
+  clearPixel(mouseX, mouseY);
 }
 
 
@@ -173,6 +183,9 @@ void addDrawing(int dX, int dY)
 
 void checkEncoders()
 {
+  int oldMouseX = mouseX;
+  int oldMouseY = mouseY;
+
   if (rotaryEncoder1.encoderChanged())
   {
     const long oldVal = encoder1Val;
@@ -183,12 +196,8 @@ void checkEncoders()
 
     if (currentMode == HandlingMode::MODE_DRAWING)
     {
-      int oldX = mouseX;
       mouseX = clampInt(mouseX + delta, 0, DISPLAY_WIDTH - 1);
-      drawLine(oldX, mouseY, mouseX, mouseY);
     }
-
-    updateTime(delta, 0);
   }
 
   if (rotaryEncoder2.encoderChanged())
@@ -201,13 +210,18 @@ void checkEncoders()
 
     if (currentMode == HandlingMode::MODE_DRAWING)
     {
-      int oldY = mouseY;
-      mouseY = clampInt(mouseY + delta, 0, DISPLAY_HEIGHT - 1);
-      drawLine(mouseX, oldY, mouseX, mouseY);
+      mouseY = clampInt(mouseY - delta, 0, DISPLAY_HEIGHT - 1);
     }
-
-    updateTime(0, delta);
   }
+
+  if (currentMode == HandlingMode::MODE_DRAWING)
+  {
+    if (mouseX != oldMouseX || mouseY != oldMouseY)
+    {
+      drawLine(oldMouseX, oldMouseY, mouseX, mouseY);
+    }
+  }
+
 }
 
 
@@ -248,6 +262,9 @@ void setup()
   {
     display.fillScreen(GxEPD_WHITE);
   } while (display.nextPage());
+
+
+  drawBitmapToBuffer(drawingBuffer, DISPLAY_WIDTH, DISPLAY_HEIGHT, giraffe_image_bytes, 0, 0, 400, 300);
 }
 
 unsigned long lastUpdate = 0;
@@ -300,20 +317,21 @@ unsigned long lastUpdate = 0;
 
 void renderScreen()
 {
-  // drawBitmapToBuffer(drawingBuffer, DISPLAY_WIDTH, DISPLAY_HEIGHT, face_image_bytes, 0, 0, 300, 300);
-  drawBitmapToBuffer(drawingBuffer, DISPLAY_WIDTH, DISPLAY_HEIGHT, giraffe_image_bytes, 0, 0, 400, 300);
-
   display.firstPage();
   display.setPartialWindow(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-  display.drawBitmap(0, 0, drawingBuffer, 400, 300, GxEPD_BLACK, GxEPD_WHITE);
-  display.nextPage();
 
+  memcpy(copyBuffer, drawingBuffer, BUFFER_SIZE);
+
+  drawBitmapToBuffer(copyBuffer, DISPLAY_WIDTH, DISPLAY_HEIGHT, giraffe_image_bytes, 0, 0, 400, 300);
+
+  display.drawBitmap(0, 0, copyBuffer, 400, 300, GxEPD_BLACK, GxEPD_WHITE);
+
+  display.nextPage();
 }
 
 void loop()
 {
   checkEncoders();
-  delay(50); // For encoder responsiveness
 
   unsigned long currentMillis = millis();
 
