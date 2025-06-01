@@ -1,4 +1,5 @@
 #include "Arduino.h"
+#include <Wire.h>
 #include "AiEsp32RotaryEncoder.h"
 #include "RTClib.h"
 #include <GxEPD2_BW.h>
@@ -10,6 +11,8 @@ struct EncoderEvent {
     bool isEncoderA;
     int delta;
 };
+
+#define RTC_INT_PIN 26
 
 // Encoder 1 pins
 #define ROTARY1_A_PIN 32
@@ -34,7 +37,7 @@ int minX = 0;
 int maxX = DISPLAY_WIDTH - 1;
 int minY = 0;
 int maxY = DISPLAY_HEIGHT - 1;
-bool changesRendered = false;
+bool changesRendered = true;
 
 uint16_t mouseX = DISPLAY_WIDTH / 2;
 uint16_t mouseY = DISPLAY_HEIGHT / 2;
@@ -282,12 +285,45 @@ void checkEncoders()
   }
 }
 
+volatile bool alarmTriggered = true;
+
+void onAlarm() {
+  alarmTriggered = true;
+}
 
 void setup()
 {
+
   Serial.begin(115200);
+  Wire.begin();
+
+  uint32_t psramSize = ESP.getPsramSize();
+  Serial.printf("PSRAM Size: %u bytes (%.2f KB)\n", psramSize, psramSize / 1024.0);
+
+  if (psramSize == 0) {
+    Serial.println("No PSRAM detected.");
+  } else {
+    Serial.println("PSRAM detected and ready.");
+  }
+
 
   rtc.begin();
+
+  rtc.clearAlarm(1);
+  rtc.disableAlarm(1);
+  rtc.writeSqwPinMode(DS3231_OFF); // Disable SQW if not used
+
+  rtc.setAlarm1(
+    rtc.now(),
+    DS3231_A1_Second
+  );
+
+  rtc.clearAlarm(1);
+
+  pinMode(RTC_INT_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(RTC_INT_PIN), onAlarm, FALLING);
+
+
 
   clockTime = rtc.now();
 
@@ -310,68 +346,14 @@ void setup()
   rotaryEncoder2.setAcceleration(0);
 
   display.init(115200, true, 2, false);
-  display.setRotation(0);
   display.setTextColor(GxEPD_BLACK);
   display.setFont(&FreeMonoBold18pt7b);
   display.setTextSize(1);
-  display.setFullWindow();
-  display.firstPage();
-  do
-  {
-    display.fillScreen(GxEPD_WHITE);
-  } while (display.nextPage());
-
 
   drawBitmapToBuffer(drawingBuffer, DISPLAY_WIDTH, DISPLAY_HEIGHT, giraffe_image_bytes, 0, 0, 400, 300);
 }
 
 unsigned long lastUpdate = 0;
-
-// void renderScreen()
-// {
-//   // Get current RTC time
-//   DateTime now = rtc.now();
-//   int hours = now.hour();
-//   int minutes = now.minute();
-
-//   // Format HH:MM
-//   char timeStr[6];
-//   snprintf(timeStr, sizeof(timeStr), "%02d:%02d", hours, minutes);
-
-//   // ---- RENDER IMAGE TOP-RIGHT ----
-//   const int imgX = 400 - 300; // assuming 200x200 image
-//   const int imgY = 0;
-//   const int imgW = 300;
-//   const int imgH = 300;
-
-//   display.setPartialWindow(imgX, imgY, imgW, imgH);
-//   display.firstPage();
-//   do
-//   {
-//     display.drawBitmap(imgX, imgY, epd_bitmap_lineart_removebg_preview, imgW, imgH, GxEPD_BLACK, GxEPD_WHITE);
-//   } while (display.nextPage());
-
-//   // ---- RENDER CLOCK BOTTOM-LEFT ----
-//   display.setFont(&FreeMonoBold18pt7b);
-//   int16_t x1, y1;
-//   uint16_t w, h;
-//   display.getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
-
-//   const int16_t pad = 10;
-//   const int clockX = pad;
-//   const int clockY = 300 - h - pad;
-//   const int clockW = w + pad * 2;
-//   const int clockH = h + pad * 2;
-
-//   display.setPartialWindow(clockX, clockY, clockW, clockH);
-//   display.firstPage();
-//   do
-//   {
-//     display.fillRect(clockX, clockY, clockW, clockH, GxEPD_WHITE);
-//     display.setCursor(clockX + pad, clockY + h); // adjust Y for baseline
-//     display.print(timeStr);
-//   } while (display.nextPage());
-// }
 
 void renderScreen()
 {
@@ -403,7 +385,9 @@ void loop()
 
   unsigned long currentMillis = millis();
 
-  if (!changesRendered && currentMillis - lastUpdate >= 100)
+  bool updateFromDrawing = !changesRendered && currentMillis - lastUpdate >= 100;
+  bool updateFromClock = alarmTriggered;
+  if (updateFromDrawing || updateFromClock)
   {
     lastUpdate = currentMillis;
 
