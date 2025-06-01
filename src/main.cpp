@@ -6,6 +6,11 @@
 #include <Fonts/FreeMonoBold18pt7b.h>
 #include "images.h"
 
+struct EncoderEvent {
+    bool isEncoderA;
+    int delta;
+};
+
 // Encoder 1 pins
 #define ROTARY1_A_PIN 32
 #define ROTARY1_B_PIN 34
@@ -23,11 +28,82 @@
 #define DISPLAY_HEIGHT 300
 #define DISPLAY_WIDTH 400
 #define BUFFER_SIZE (DISPLAY_WIDTH * DISPLAY_HEIGHT / 8)
+
 uint8_t drawingBuffer[BUFFER_SIZE] = {0};
-uint8_t copyBuffer[BUFFER_SIZE] = {0};
+int minX = 0;
+int maxX = DISPLAY_WIDTH - 1;
+int minY = 0;
+int maxY = DISPLAY_HEIGHT - 1;
+bool changesRendered = false;
 
 uint16_t mouseX = DISPLAY_WIDTH / 2;
 uint16_t mouseY = DISPLAY_HEIGHT / 2;
+
+void addDrawingBoundingPoint(int x, int y)
+{
+  minX = min(minX, x);
+  maxX = max(maxX, x);
+  minY = min(minY, y);
+  maxY = max(maxY, y);
+  changesRendered = false;
+}
+
+#define ENC_BUFFER_SIZE 64
+
+class EncoderRingBuffer {
+public:
+  EncoderEvent buffer[ENC_BUFFER_SIZE];
+  size_t head = 0;
+  size_t tail = 0;
+  bool isFull = false;
+
+  bool push(const EncoderEvent& event) {
+    if (isFull) return false;
+
+    buffer[head] = event;
+    head = (head + 1) % ENC_BUFFER_SIZE;
+    isFull = (head == tail);
+    return true;
+  }
+
+  bool pop(EncoderEvent& event) {
+    if (isEmpty()) return false;
+
+    event = buffer[tail];
+    tail = (tail + 1) % ENC_BUFFER_SIZE;
+    isFull = false;
+    return true;
+  }
+
+  bool peek(EncoderEvent &event) const {
+    if (isEmpty()) return false;
+    event = buffer[tail];
+    return true;
+  }
+  
+
+  bool isEmpty() const {
+    return (!isFull && head == tail);
+  }
+
+  size_t size() const {
+    if (isFull) return ENC_BUFFER_SIZE;
+    if (head >= tail) return head - tail;
+    return ENC_BUFFER_SIZE - tail + head;
+  }
+
+  void clear() {
+    head = tail = 0;
+    isFull = false;
+  }
+};
+
+EncoderRingBuffer eventBuffer;
+
+void onEncoderTurn(bool isA, int delta) {
+  EncoderEvent e = { isA, delta };
+  eventBuffer.push(e);
+}
 
 int clampInt(int x, int low, int high) {
   if (x < low) return low;
@@ -73,6 +149,8 @@ void drawBitmapToBuffer(uint8_t *buffer, int bufWidth, int bufHeight, const uint
       }
     }
   }
+  addDrawingBoundingPoint(x, y);
+  addDrawingBoundingPoint(x + w - 1, y + h - 1);
 }
 
 
@@ -92,12 +170,24 @@ AiEsp32RotaryEncoder rotaryEncoder2(ROTARY2_A_PIN, ROTARY2_B_PIN, ROTARY2_BUTTON
 
 void IRAM_ATTR readEncoderISR1()
 {
+  long oldValue = rotaryEncoder1.readEncoder();
   rotaryEncoder1.readEncoder_ISR();
+  if (rotaryEncoder1.encoderChanged()) {
+    long newValue = rotaryEncoder1.readEncoder();
+    long delta = newValue - oldValue;
+    onEncoderTurn(true, delta);
+  }
 }
 
 void IRAM_ATTR readEncoderISR2()
 {
+  long oldValue = rotaryEncoder2.readEncoder();
   rotaryEncoder2.readEncoder_ISR();
+  if (rotaryEncoder2.encoderChanged()) {
+    long newValue = rotaryEncoder2.readEncoder();
+    long delta = newValue - oldValue;
+    onEncoderTurn(false, delta);
+  }
 }
 
 int encoder1Val = 0;
@@ -122,18 +212,14 @@ void updateTime(int dHours, int dMinutes)
   clockTime = rtc.now();
 }
 
-void drawSimplePixel(int x, int y) {
-  if (x < 0 || x >= DISPLAY_WIDTH || y < 0 || y >= DISPLAY_HEIGHT) return;
-  int byteIndex = (y * DISPLAY_WIDTH + x) / 8;
-  int bitIndex = 7 - (x % 8);
-  drawingBuffer[byteIndex] |= (1 << bitIndex);
-}
+
 
 void drawPixel(int x, int y) {
   if (x < 0 || x >= DISPLAY_WIDTH || y < 0 || y >= DISPLAY_HEIGHT) return;
   int byteIndex = (y * DISPLAY_WIDTH + x) / 8;
   int bitIndex = 7 - (x % 8);
   drawingBuffer[byteIndex] |= (1 << bitIndex);
+  addDrawingBoundingPoint(x, y);
 }
 
 void clearPixel(int x, int y) {
@@ -141,6 +227,7 @@ void clearPixel(int x, int y) {
   int byteIndex = (y * DISPLAY_WIDTH + x) / 8;
   int bitIndex = 7 - (x % 8);
   drawingBuffer[byteIndex] &= ~(1 << bitIndex); // Clear the bit
+  addDrawingBoundingPoint(x, y);
 }
 
 void drawLine(int x0, int y0, int x1, int y1) {
@@ -167,61 +254,32 @@ void drawLine(int x0, int y0, int x1, int y1) {
   clearPixel(mouseX, mouseY);
 }
 
-
-
-
-void addDrawing(int dX, int dY)
-{
-  // Draw a pixel at the current mouse position
-  int x = clampInt(mouseX + dX, 0, DISPLAY_WIDTH - 1);
-  int y = clampInt(mouseY + dY, 0, DISPLAY_HEIGHT - 1);
-
-  int byteIndex = (y * DISPLAY_WIDTH + x) / 8;
-  int bitIndex = 7 - (x % 8); // MSB first
-  drawingBuffer[byteIndex] |= (1 << bitIndex);
-}
-
 void checkEncoders()
 {
-  int oldMouseX = mouseX;
-  int oldMouseY = mouseY;
-
-  if (rotaryEncoder1.encoderChanged())
+  while (!eventBuffer.isEmpty())
   {
-    const long oldVal = encoder1Val;
-    encoder1Val = rotaryEncoder1.readEncoder();
-    const long delta = encoder1Val - oldVal;
-
-    Serial.printf("Encoder 1 value: %d | delta: %d \n", encoder1Val, delta);
-
     if (currentMode == HandlingMode::MODE_DRAWING)
     {
-      mouseX = clampInt(mouseX + delta, 0, DISPLAY_WIDTH - 1);
+      EncoderEvent event;
+      bool success = eventBuffer.pop(event);
+      if (success)
+      {
+        int oldMouseX = mouseX;
+        int oldMouseY = mouseY;
+
+        if (event.isEncoderA) {
+          mouseX = clampInt(mouseX + event.delta, 0, DISPLAY_WIDTH - 1);
+        } else {
+          mouseY = clampInt(mouseY - event.delta, 0, DISPLAY_HEIGHT - 1);
+        }
+
+        if (mouseX != oldMouseX || mouseY != oldMouseY)
+        {
+          drawLine(oldMouseX, oldMouseY, mouseX, mouseY);
+        }
+      }
     }
   }
-
-  if (rotaryEncoder2.encoderChanged())
-  {
-    const long oldVal = encoder2Val;
-    encoder2Val = rotaryEncoder2.readEncoder();
-    const long delta = encoder2Val - oldVal;
-
-    Serial.printf("Encoder 2 value: %d | delta: %d \n", encoder2Val, delta);
-
-    if (currentMode == HandlingMode::MODE_DRAWING)
-    {
-      mouseY = clampInt(mouseY - delta, 0, DISPLAY_HEIGHT - 1);
-    }
-  }
-
-  if (currentMode == HandlingMode::MODE_DRAWING)
-  {
-    if (mouseX != oldMouseX || mouseY != oldMouseY)
-    {
-      drawLine(oldMouseX, oldMouseY, mouseX, mouseY);
-    }
-  }
-
 }
 
 
@@ -317,17 +375,27 @@ unsigned long lastUpdate = 0;
 
 void renderScreen()
 {
+
+  display.setPartialWindow(minX, minY, maxX - minX + 1, maxY - minY + 1);
+
   display.firstPage();
-  display.setPartialWindow(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  do {
+    display.drawBitmap(minX, minY, drawingBuffer, 400, 300, GxEPD_BLACK, GxEPD_WHITE);
 
-  memcpy(copyBuffer, drawingBuffer, BUFFER_SIZE);
+    DateTime now = rtc.now();
+    int hours = now.hour();
+    int minutes = now.minute();
+    char timeStr[6];
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d", hours, minutes);
+    display.setFont(&FreeMonoBold18pt7b);
+    display.setCursor(40, 40 + 18); // Adjust Y for baseline
+    display.print(timeStr);
 
-  drawBitmapToBuffer(copyBuffer, DISPLAY_WIDTH, DISPLAY_HEIGHT, giraffe_image_bytes, 0, 0, 400, 300);
+  } while (display.nextPage());
 
-  display.drawBitmap(0, 0, copyBuffer, 400, 300, GxEPD_BLACK, GxEPD_WHITE);
-
-  display.nextPage();
+  changesRendered = true;
 }
+
 
 void loop()
 {
@@ -335,7 +403,7 @@ void loop()
 
   unsigned long currentMillis = millis();
 
-  if (currentMillis - lastUpdate >= 1000)
+  if (!changesRendered && currentMillis - lastUpdate >= 100)
   {
     lastUpdate = currentMillis;
 
