@@ -1,10 +1,11 @@
 #include "Arduino.h"
+#include <stdlib.h>
 #include <Wire.h>
 #include "AiEsp32RotaryEncoder.h"
 #include "RTClib.h"
 #include <GxEPD2_BW.h>
-#include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMonoBold18pt7b.h>
+#include <Fonts/FreeMonoBold9pt7b.h>
 #include "images.h"
 
 struct EncoderEvent {
@@ -13,6 +14,11 @@ struct EncoderEvent {
 };
 
 #define RTC_INT_PIN 26
+volatile bool clockNeedsUpdate = true;
+
+#define SHAKE_PIN 13
+#define SHAKE_TIMEOUT 1000
+#define SHAKE_THRESHOLD 1500
 
 // Encoder 1 pins
 #define ROTARY1_A_PIN 32
@@ -32,6 +38,7 @@ struct EncoderEvent {
 #define DISPLAY_WIDTH 400
 #define BUFFER_SIZE (DISPLAY_WIDTH * DISPLAY_HEIGHT / 8)
 
+
 uint8_t drawingBuffer[BUFFER_SIZE] = {0};
 int minX = 0;
 int maxX = DISPLAY_WIDTH - 1;
@@ -42,12 +49,20 @@ bool changesRendered = true;
 uint16_t mouseX = DISPLAY_WIDTH / 2;
 uint16_t mouseY = DISPLAY_HEIGHT / 2;
 
+int clampInt(int x, int low, int high) {
+  if (x < low) return low;
+  if (x > high) return high;
+  return x;
+}
+
 void addDrawingBoundingPoint(int x, int y)
 {
+  // if all changes are already rendered then we should set the initial bounding box to the first drawing point
   minX = min(minX, x);
   maxX = max(maxX, x);
   minY = min(minY, y);
   maxY = max(maxY, y);
+  
   changesRendered = false;
 }
 
@@ -108,18 +123,15 @@ void onEncoderTurn(bool isA, int delta) {
   eventBuffer.push(e);
 }
 
-int clampInt(int x, int low, int high) {
-  if (x < low) return low;
-  if (x > high) return high;
-  return x;
-}
+
 
 enum HandlingMode {
   MODE_SET_CLOCK,
+
   MODE_DRAWING,
 };
 
-HandlingMode currentMode = MODE_DRAWING;
+HandlingMode currentMode = HandlingMode::MODE_DRAWING;
 
 void drawBitmapToBuffer(uint8_t *buffer, int bufWidth, int bufHeight, const uint8_t *bitmap, int x, int y, int w, int h)
 {
@@ -213,9 +225,27 @@ void updateTime(int dHours, int dMinutes)
   rtc.adjust(DateTime(now.year(), now.month(), now.day(), newHour, newMinute, now.second()));
   Serial.printf("RTC updated to: %02d:%02d\n", newHour, newMinute);
   clockTime = rtc.now();
+  clockNeedsUpdate = true;
 }
 
+void formatTime12Hour(int hour24, int minute, char* outBuffer, size_t bufferSize) {
+  // Constrain inputs
+  hour24 = constrain(hour24, 0, 23);
+  minute = constrain(minute, 0, 59);
 
+  // Convert to 12-hour format
+  int hour12;
+  if (hour24 == 0) {
+    hour12 = 12;
+  } else if (hour24 > 12) {
+    hour12 = hour24 - 12;
+  } else {
+    hour12 = hour24;
+  }
+
+  // Write to buffer, ensure null-termination
+  snprintf(outBuffer, bufferSize, "%d:%02d", hour12, minute);
+}
 
 void drawPixel(int x, int y) {
   if (x < 0 || x >= DISPLAY_WIDTH || y < 0 || y >= DISPLAY_HEIGHT) return;
@@ -257,7 +287,7 @@ void drawLine(int x0, int y0, int x1, int y1) {
   clearPixel(mouseX, mouseY);
 }
 
-void checkEncoders()
+void handleEncoderEvents()
 {
   while (!eventBuffer.isEmpty())
   {
@@ -282,13 +312,34 @@ void checkEncoders()
         }
       }
     }
+    else if (currentMode == HandlingMode::MODE_SET_CLOCK)
+    {
+      EncoderEvent event;
+      bool success = eventBuffer.pop(event);
+      if (success)
+      {
+        if (event.isEncoderA) {
+          encoder1Val += event.delta;
+          updateTime(event.delta, 0);
+        } else {
+          encoder2Val += event.delta;
+          updateTime(0, event.delta);
+        }
+      }
+    }
   }
 }
 
-volatile bool alarmTriggered = true;
 
 void onAlarm() {
-  alarmTriggered = true;
+  clockNeedsUpdate = true;
+}
+
+volatile int shakeCount = 0;
+unsigned long shakeStartTime = 0;
+
+void IRAM_ATTR shakeISR() {
+  shakeCount++;
 }
 
 void setup()
@@ -297,14 +348,8 @@ void setup()
   Serial.begin(115200);
   Wire.begin();
 
-  uint32_t psramSize = ESP.getPsramSize();
-  Serial.printf("PSRAM Size: %u bytes (%.2f KB)\n", psramSize, psramSize / 1024.0);
-
-  if (psramSize == 0) {
-    Serial.println("No PSRAM detected.");
-  } else {
-    Serial.println("PSRAM detected and ready.");
-  }
+  pinMode(SHAKE_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(SHAKE_PIN), shakeISR, FALLING);
 
 
   rtc.begin();
@@ -322,7 +367,6 @@ void setup()
 
   pinMode(RTC_INT_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(RTC_INT_PIN), onAlarm, FALLING);
-
 
 
   clockTime = rtc.now();
@@ -368,25 +412,89 @@ void renderScreen()
     int hours = now.hour();
     int minutes = now.minute();
     char timeStr[6];
-    snprintf(timeStr, sizeof(timeStr), "%02d:%02d", hours, minutes);
+    formatTime12Hour(hours, minutes, timeStr, sizeof(timeStr));
+
     display.setFont(&FreeMonoBold18pt7b);
-    display.setCursor(40, 40 + 18); // Adjust Y for baseline
+    display.setCursor(40, 58); // 40 is X, 58 is Y baseline
     display.print(timeStr);
+
+    // Measure width of time string to find where to place "AM"/"PM"
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds(timeStr, 40, 58, &x1, &y1, &w, &h);
+
+    // Use a smaller font for AM/PM
+    display.setFont(&FreeMonoBold9pt7b); // or another small font
+    display.setCursor(40 + w + 8, 50); // Position AM/PM right of time
+    display.print((hours < 12) ? "AM" : "PM");
+
+
 
   } while (display.nextPage());
 
   changesRendered = true;
 }
 
+#include <stdlib.h>  // Required for random()
+
+void handleShake()
+{
+  // print num shakes:
+  Serial.printf("Shake detected! Count: %d\n", shakeCount);
+  if (currentMode == HandlingMode::MODE_DRAWING)
+  {
+    int totalPixels = DISPLAY_WIDTH * DISPLAY_HEIGHT;
+    int pixelsToClear = (int)(totalPixels * 2.5);
+
+    for (int i = 0; i < pixelsToClear; i++)
+    {
+      int x = random(0, DISPLAY_WIDTH);
+      int y = random(0, DISPLAY_HEIGHT);
+      clearPixel(x, y);
+    }
+
+    changesRendered = false;
+  }
+}
+
+
+void checkShake()
+{
+  if (shakeCount > 0)
+  {
+    if (shakeStartTime == 0)
+    {
+      shakeStartTime = millis();
+    }
+
+    if (millis() - shakeStartTime > SHAKE_TIMEOUT)
+    {
+      if (shakeCount >= SHAKE_THRESHOLD)
+      {
+        handleShake();
+      }
+      else
+      {
+        Serial.println("Shake not strong enough.");
+      }
+
+      shakeCount = 0;
+      shakeStartTime = 0;
+    }
+  }
+}
 
 void loop()
 {
-  checkEncoders();
+
+  checkShake();
+
+  handleEncoderEvents();
 
   unsigned long currentMillis = millis();
 
   bool updateFromDrawing = !changesRendered && currentMillis - lastUpdate >= 100;
-  bool updateFromClock = alarmTriggered;
+  bool updateFromClock = clockNeedsUpdate;
   if (updateFromDrawing || updateFromClock)
   {
     lastUpdate = currentMillis;
