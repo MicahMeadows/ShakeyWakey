@@ -14,11 +14,14 @@ struct EncoderEvent {
 };
 
 #define RTC_INT_PIN 26
-volatile bool clockNeedsUpdate = true;
+// volatile bool clockNeedsUpdate = true;
+volatile bool shouldCheckAlarm = false;
+
+#define BUZZER_PIN 15
 
 #define SHAKE_PIN 13
-#define SHAKE_TIMEOUT 1000
-#define SHAKE_THRESHOLD 1500
+#define SHAKE_TIMEOUT 800
+#define SHAKE_THRESHOLD 2200
 
 // Encoder 1 pins
 #define ROTARY1_A_PIN 32
@@ -44,10 +47,40 @@ int minX = 0;
 int maxX = DISPLAY_WIDTH - 1;
 int minY = 0;
 int maxY = DISPLAY_HEIGHT - 1;
-bool changesRendered = true;
 
 uint16_t mouseX = DISPLAY_WIDTH / 2;
 uint16_t mouseY = DISPLAY_HEIGHT / 2;
+
+bool alarmActive = false;
+TaskHandle_t BeepTaskHandle = NULL;
+
+void triggerAlarm(void *parameter) {
+  alarmActive = true;
+  while (alarmActive)
+  {
+    tone(BUZZER_PIN, 1500, 1000);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    tone(BUZZER_PIN, 1500, 1000);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    tone(BUZZER_PIN, 1500, 1000);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+
+  BeepTaskHandle = NULL;
+  vTaskDelete(NULL);
+}
+
+unsigned long nextUpdate = 0;
+
+void markDirty(int delay)
+{
+  if (nextUpdate == -1)
+  {
+    nextUpdate = millis() + delay;
+  }
+}
 
 int clampInt(int x, int low, int high) {
   if (x < low) return low;
@@ -63,7 +96,7 @@ void addDrawingBoundingPoint(int x, int y)
   minY = min(minY, y);
   maxY = max(maxY, y);
   
-  changesRendered = false;
+  markDirty(100);
 }
 
 #define ENC_BUFFER_SIZE 64
@@ -123,15 +156,24 @@ void onEncoderTurn(bool isA, int delta) {
   eventBuffer.push(e);
 }
 
-
+enum AlarmMode {
+  ALARM_UNSET,
+  ALARM_SET,
+  ALARM_ACTIVE,
+  ALARM_SNOOZED,
+};
+AlarmMode alarmMode = ALARM_UNSET;
+DateTime currentAlarm = DateTime(0, 0, 0, 0, 0, 0);
 
 enum HandlingMode {
   MODE_SET_CLOCK,
-
+  MODE_SET_ALARM,
   MODE_DRAWING,
 };
 
-HandlingMode currentMode = HandlingMode::MODE_DRAWING;
+// HandlingMode currentMode = HandlingMode::MODE_DRAWING;
+// HandlingMode currentMode = HandlingMode::MODE_SET_CLOCK;
+HandlingMode currentMode = HandlingMode::MODE_SET_ALARM;
 
 void drawBitmapToBuffer(uint8_t *buffer, int bufWidth, int bufHeight, const uint8_t *bitmap, int x, int y, int w, int h)
 {
@@ -225,7 +267,30 @@ void updateTime(int dHours, int dMinutes)
   rtc.adjust(DateTime(now.year(), now.month(), now.day(), newHour, newMinute, now.second()));
   Serial.printf("RTC updated to: %02d:%02d\n", newHour, newMinute);
   clockTime = rtc.now();
-  clockNeedsUpdate = true;
+  // clockNeedsUpdate = true;
+  markDirty(0);
+}
+
+void disableAlarm()
+{
+  alarmMode = AlarmMode::ALARM_UNSET;
+}
+
+void snoozeAlarm()
+{
+  alarmMode == AlarmMode::ALARM_SNOOZED;
+}
+
+void updateAlarm(int dHours, int dMinutes)
+{
+  currentAlarm = currentAlarm + TimeSpan(0, dHours, dMinutes, 0);
+
+  alarmMode = ALARM_SET;
+
+  rtc.clearAlarm(2);
+  rtc.setAlarm2(currentAlarm, DS3231_A2_Date);
+
+  Serial.printf("Alarm updated to: %02d:%02d\n", currentAlarm.hour(), currentAlarm.minute());
 }
 
 void formatTime12Hour(int hour24, int minute, char* outBuffer, size_t bufferSize) {
@@ -327,12 +392,27 @@ void handleEncoderEvents()
         }
       }
     }
+    else if (currentMode == HandlingMode::MODE_SET_ALARM)
+    {
+      EncoderEvent event;
+      bool success = eventBuffer.pop(event);
+      if (success)
+      {
+        if (event.isEncoderA) {
+          encoder1Val += event.delta;
+          updateAlarm(event.delta, 0);
+        } else {
+          updateAlarm(0, event.delta);
+        }
+      }
+    }
   }
 }
 
 
 void onAlarm() {
-  clockNeedsUpdate = true;
+  shouldCheckAlarm = true;
+  markDirty(0);
 }
 
 volatile int shakeCount = 0;
@@ -347,6 +427,8 @@ void setup()
 
   Serial.begin(115200);
   Wire.begin();
+
+  pinMode(BUZZER_PIN, OUTPUT);
 
   pinMode(SHAKE_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(SHAKE_PIN), shakeISR, FALLING);
@@ -397,7 +479,7 @@ void setup()
   drawBitmapToBuffer(drawingBuffer, DISPLAY_WIDTH, DISPLAY_HEIGHT, giraffe_image_bytes, 0, 0, 400, 300);
 }
 
-unsigned long lastUpdate = 0;
+// unsigned long lastUpdate = 0;
 
 void renderScreen()
 {
@@ -431,8 +513,6 @@ void renderScreen()
 
 
   } while (display.nextPage());
-
-  changesRendered = true;
 }
 
 #include <stdlib.h>  // Required for random()
@@ -453,7 +533,13 @@ void handleShake()
       clearPixel(x, y);
     }
 
-    changesRendered = false;
+    markDirty(0);
+  }
+
+  if (alarmActive)
+  {
+    Serial.println("Alarm active. Shake turns it off!");
+    alarmActive = false;
   }
 }
 
@@ -484,8 +570,31 @@ void checkShake()
   }
 }
 
+void checkAlarm()
+{
+  if (shouldCheckAlarm == true)
+  {
+    Serial.println("Checking alarm...");
+    DateTime now = rtc.now();
+    if (now >= currentAlarm)
+    {
+      xTaskCreatePinnedToCore(
+        triggerAlarm,          // Task function
+        "BeepTask",       // Name of the task
+        2048,             // Stack size (in bytes)
+        NULL,             // Task input parameter
+        1,                // Priority of the task
+        &BeepTaskHandle,  // Task handle
+        0                 // Core where the task should run (0 for core 0)
+      );
+    }
+  }
+  shouldCheckAlarm = false;
+}
+
 void loop()
 {
+  checkAlarm();
 
   checkShake();
 
@@ -493,12 +602,9 @@ void loop()
 
   unsigned long currentMillis = millis();
 
-  bool updateFromDrawing = !changesRendered && currentMillis - lastUpdate >= 100;
-  bool updateFromClock = clockNeedsUpdate;
-  if (updateFromDrawing || updateFromClock)
+  if (nextUpdate != -1 && currentMillis >= nextUpdate)
   {
-    lastUpdate = currentMillis;
-
     renderScreen();
+    nextUpdate = -1;
   }
 }
