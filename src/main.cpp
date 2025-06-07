@@ -58,7 +58,7 @@ struct EncoderEvent {
 AlarmMode alarmMode = ALARM_UNSET;
 DateTime currentAlarm = DateTime(0, 0, 0, 0, 0, 0);
 int snoozeAmount = 10; // Snooze amount in minutes
-int snoozedCount = 0;
+int snoozeCount = 0;
 
 
 uint8_t drawingBuffer[BUFFER_SIZE] = {0};
@@ -79,8 +79,18 @@ void triggerAlarm(void *parameter) {
     tone(BUZZER_PIN, 1500, 1000);
     vTaskDelay(pdMS_TO_TICKS(2000));
 
+    if (alarmMode != AlarmMode::ALARM_ACTIVE)
+    {
+      break;
+    }
+
     tone(BUZZER_PIN, 1500, 1000);
     vTaskDelay(pdMS_TO_TICKS(2000));
+
+    if (alarmMode != AlarmMode::ALARM_ACTIVE)
+    {
+      break;
+    }
 
     tone(BUZZER_PIN, 1500, 1000);
     vTaskDelay(pdMS_TO_TICKS(2000));
@@ -498,7 +508,7 @@ void renderScreen()
 
     // Draw alarm time below in non-bold font
     char alarmStr[16];
-    DateTime currentAlarmPlusSnooze = currentAlarm + TimeSpan(0, 0, snoozeAmount * snoozedCount, 0);
+    DateTime currentAlarmPlusSnooze = currentAlarm + TimeSpan(0, 0, snoozeAmount * snoozeCount, 0);
     // int alarmHours = currentAlarm.hour();
     // int alarmMinutes = currentAlarm.minute();
     int alarmHours = currentAlarmPlusSnooze.hour();
@@ -530,7 +540,7 @@ void renderScreen()
 void handleShake()
 {
   // print num shakes:
-  Serial.printf("Shake detected! Count: %d\n", shakeCount);
+  // Serial.printf("Shake detected! Count: %d\n", shakeCount);
   if (handlingMode == HandlingMode::MODE_DRAWING)
   {
     int totalPixels = DISPLAY_WIDTH * DISPLAY_HEIGHT;
@@ -550,7 +560,7 @@ void handleShake()
   {
     Serial.println("Alarm active. Shake turns it off!");
     alarmMode = AlarmMode::ALARM_SNOOZED;
-    snoozedCount++;
+    snoozeCount += 1;
     markDirty(0);
   }
 }
@@ -571,10 +581,10 @@ void checkShake()
       {
         handleShake();
       }
-      else
-      {
-        Serial.println("Shake not strong enough.");
-      }
+      // else
+      // {
+      //   Serial.println("Shake not strong enough.");
+      // }
 
       shakeCount = 0;
       shakeStartTime = 0;
@@ -586,17 +596,16 @@ void checkAlarm()
 {
   if (shouldCheckAlarm)
   {
+    markDirty(0);
     rtc.clearAlarm(2);
     Serial.println("Checking alarm...");
     if (alarmMode == AlarmMode::ALARM_SET || alarmMode == AlarmMode::ALARM_SNOOZED)
     {
       DateTime now = rtc.now();
-      Serial.printf("Current alarm time: %02d:%02d\n", currentAlarm.hour(), currentAlarm.minute());
-      Serial.printf("Current time: %02d:%02d\n", now.hour(), now.minute());
+      DateTime currentAlarmPlusSnooze = currentAlarm + TimeSpan(0, 0, snoozeAmount * snoozeCount, 0);
       int nowMinutes = now.hour() * 60 + now.minute();
-      int currentAlarmMinutes = currentAlarm.hour() * 60 + currentAlarm.minute();
+      int currentAlarmMinutes = currentAlarmPlusSnooze.hour() * 60 + currentAlarmPlusSnooze.minute();
 
-      Serial.printf("Now minutes: %d, Alarm minutes: %d\n", nowMinutes, currentAlarmMinutes);
       int difference = nowMinutes - currentAlarmMinutes;
       if (difference >= 0 && difference < 2)
       {
@@ -628,9 +637,7 @@ void loop()
 
   if (nextUpdate != -1 && currentMillis >= nextUpdate)
   {
-    Serial.println("Rendering screen...");
-    Serial.printf("currentMillis: %lu, nextUpdate: %lu\n", currentMillis, nextUpdate);
-    nextUpdate = -1;
     renderScreen();
+    nextUpdate = -1;
   }
 }
