@@ -6,12 +6,8 @@
 #include <GxEPD2_BW.h>
 #include <Fonts/FreeMonoBold18pt7b.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
+#include <Fonts/FreeMono9pt7b.h>
 #include "images.h"
-
-struct EncoderEvent {
-    bool isEncoderA;
-    int delta;
-};
 
 #define RTC_INT_PIN 26
 // volatile bool clockNeedsUpdate = true;
@@ -41,6 +37,29 @@ volatile bool shouldCheckAlarm = false;
 #define DISPLAY_WIDTH 400
 #define BUFFER_SIZE (DISPLAY_WIDTH * DISPLAY_HEIGHT / 8)
 
+enum HandlingMode {
+  MODE_SET_CLOCK,
+  MODE_SET_ALARM,
+  MODE_DRAWING,
+};
+
+enum AlarmMode {
+  ALARM_UNSET,
+  ALARM_SET,
+  ALARM_ACTIVE,
+  ALARM_SNOOZED,
+};
+
+struct EncoderEvent {
+    bool isEncoderA;
+    int delta;
+};
+
+AlarmMode alarmMode = ALARM_UNSET;
+DateTime currentAlarm = DateTime(0, 0, 0, 0, 0, 0);
+int snoozeAmount = 10; // Snooze amount in minutes
+int snoozedCount = 0;
+
 
 uint8_t drawingBuffer[BUFFER_SIZE] = {0};
 int minX = 0;
@@ -51,12 +70,11 @@ int maxY = DISPLAY_HEIGHT - 1;
 uint16_t mouseX = DISPLAY_WIDTH / 2;
 uint16_t mouseY = DISPLAY_HEIGHT / 2;
 
-bool alarmActive = false;
 TaskHandle_t BeepTaskHandle = NULL;
 
 void triggerAlarm(void *parameter) {
-  alarmActive = true;
-  while (alarmActive)
+  alarmMode = AlarmMode::ALARM_ACTIVE;
+  while (alarmMode == AlarmMode::ALARM_ACTIVE)
   {
     tone(BUZZER_PIN, 1500, 1000);
     vTaskDelay(pdMS_TO_TICKS(2000));
@@ -156,24 +174,8 @@ void onEncoderTurn(bool isA, int delta) {
   eventBuffer.push(e);
 }
 
-enum AlarmMode {
-  ALARM_UNSET,
-  ALARM_SET,
-  ALARM_ACTIVE,
-  ALARM_SNOOZED,
-};
-AlarmMode alarmMode = ALARM_UNSET;
-DateTime currentAlarm = DateTime(0, 0, 0, 0, 0, 0);
-
-enum HandlingMode {
-  MODE_SET_CLOCK,
-  MODE_SET_ALARM,
-  MODE_DRAWING,
-};
-
-// HandlingMode currentMode = HandlingMode::MODE_DRAWING;
-// HandlingMode currentMode = HandlingMode::MODE_SET_CLOCK;
-HandlingMode currentMode = HandlingMode::MODE_SET_ALARM;
+// HandlingMode handlingMode = HandlingMode::MODE_DRAWING;
+HandlingMode handlingMode = HandlingMode::MODE_DRAWING;
 
 void drawBitmapToBuffer(uint8_t *buffer, int bufWidth, int bufHeight, const uint8_t *bitmap, int x, int y, int w, int h)
 {
@@ -247,8 +249,6 @@ void IRAM_ATTR readEncoderISR2()
   }
 }
 
-int encoder1Val = 0;
-int encoder2Val = 0;
 bool setClockMode = true;
 
 DateTime clockTime(__DATE__, __TIME__);
@@ -271,26 +271,14 @@ void updateTime(int dHours, int dMinutes)
   markDirty(0);
 }
 
-void disableAlarm()
-{
-  alarmMode = AlarmMode::ALARM_UNSET;
-}
-
-void snoozeAlarm()
-{
-  alarmMode == AlarmMode::ALARM_SNOOZED;
-}
-
 void updateAlarm(int dHours, int dMinutes)
 {
   currentAlarm = currentAlarm + TimeSpan(0, dHours, dMinutes, 0);
 
-  alarmMode = ALARM_SET;
-
-  rtc.clearAlarm(2);
-  rtc.setAlarm2(currentAlarm, DS3231_A2_Date);
+  alarmMode = AlarmMode::ALARM_SET;
 
   Serial.printf("Alarm updated to: %02d:%02d\n", currentAlarm.hour(), currentAlarm.minute());
+  markDirty(0);
 }
 
 void formatTime12Hour(int hour24, int minute, char* outBuffer, size_t bufferSize) {
@@ -352,11 +340,11 @@ void drawLine(int x0, int y0, int x1, int y1) {
   clearPixel(mouseX, mouseY);
 }
 
-void handleEncoderEvents()
+void checkEncoders()
 {
   while (!eventBuffer.isEmpty())
   {
-    if (currentMode == HandlingMode::MODE_DRAWING)
+    if (handlingMode == HandlingMode::MODE_DRAWING)
     {
       EncoderEvent event;
       bool success = eventBuffer.pop(event);
@@ -377,29 +365,26 @@ void handleEncoderEvents()
         }
       }
     }
-    else if (currentMode == HandlingMode::MODE_SET_CLOCK)
+    else if (handlingMode == HandlingMode::MODE_SET_CLOCK)
     {
       EncoderEvent event;
       bool success = eventBuffer.pop(event);
       if (success)
       {
         if (event.isEncoderA) {
-          encoder1Val += event.delta;
           updateTime(event.delta, 0);
         } else {
-          encoder2Val += event.delta;
           updateTime(0, event.delta);
         }
       }
     }
-    else if (currentMode == HandlingMode::MODE_SET_ALARM)
+    else if (handlingMode == HandlingMode::MODE_SET_ALARM)
     {
       EncoderEvent event;
       bool success = eventBuffer.pop(event);
       if (success)
       {
         if (event.isEncoderA) {
-          encoder1Val += event.delta;
           updateAlarm(event.delta, 0);
         } else {
           updateAlarm(0, event.delta);
@@ -410,9 +395,8 @@ void handleEncoderEvents()
 }
 
 
-void onAlarm() {
+void IRAM_ATTR onAlarm() {
   shouldCheckAlarm = true;
-  markDirty(0);
 }
 
 volatile int shakeCount = 0;
@@ -436,22 +420,24 @@ void setup()
 
   rtc.begin();
 
-  rtc.clearAlarm(1);
   rtc.disableAlarm(1);
+  rtc.disableAlarm(2);
+  rtc.clearAlarm(1);
+  rtc.clearAlarm(2);
+
   rtc.writeSqwPinMode(DS3231_OFF); // Disable SQW if not used
 
-  rtc.setAlarm1(
-    rtc.now(),
-    DS3231_A1_Second
+  rtc.setAlarm2(
+    DateTime(0, 0, 0, 0, 0, 0),
+    DS3231_A2_PerMinute
   );
-
-  rtc.clearAlarm(1);
 
   pinMode(RTC_INT_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(RTC_INT_PIN), onAlarm, FALLING);
 
-
   clockTime = rtc.now();
+  currentAlarm = rtc.now();
+  updateAlarm(0, 1);
 
   if (rtc.lostPower())
   {
@@ -510,7 +496,31 @@ void renderScreen()
     display.setCursor(40 + w + 8, 50); // Position AM/PM right of time
     display.print((hours < 12) ? "AM" : "PM");
 
+    // Draw alarm time below in non-bold font
+    char alarmStr[16];
+    DateTime currentAlarmPlusSnooze = currentAlarm + TimeSpan(0, 0, snoozeAmount * snoozedCount, 0);
+    // int alarmHours = currentAlarm.hour();
+    // int alarmMinutes = currentAlarm.minute();
+    int alarmHours = currentAlarmPlusSnooze.hour();
+    int alarmMinutes = currentAlarmPlusSnooze.minute();
+    char alarmTime[6];
+    formatTime12Hour(alarmHours, alarmMinutes, alarmTime, sizeof(alarmTime));
 
+    snprintf(alarmStr, sizeof(alarmStr), "%s %s", alarmTime, (alarmHours < 12) ? "AM" : "PM");
+
+    display.setFont(&FreeMono9pt7b); // Non-bold font
+    display.setCursor(40, 75); // Slightly below current time
+    display.print(alarmStr);
+
+    display.setCursor(300, 20);
+    if (handlingMode == HandlingMode::MODE_SET_CLOCK)
+    {
+      display.print("Set Clock");
+    }
+    else if (handlingMode == HandlingMode::MODE_SET_ALARM)
+    {
+      display.print("Set Alarm");
+    }
 
   } while (display.nextPage());
 }
@@ -521,7 +531,7 @@ void handleShake()
 {
   // print num shakes:
   Serial.printf("Shake detected! Count: %d\n", shakeCount);
-  if (currentMode == HandlingMode::MODE_DRAWING)
+  if (handlingMode == HandlingMode::MODE_DRAWING)
   {
     int totalPixels = DISPLAY_WIDTH * DISPLAY_HEIGHT;
     int pixelsToClear = (int)(totalPixels * 2.5);
@@ -536,10 +546,12 @@ void handleShake()
     markDirty(0);
   }
 
-  if (alarmActive)
+  if (alarmMode == AlarmMode::ALARM_ACTIVE)
   {
     Serial.println("Alarm active. Shake turns it off!");
-    alarmActive = false;
+    alarmMode = AlarmMode::ALARM_SNOOZED;
+    snoozedCount++;
+    markDirty(0);
   }
 }
 
@@ -572,21 +584,33 @@ void checkShake()
 
 void checkAlarm()
 {
-  if (shouldCheckAlarm == true)
+  if (shouldCheckAlarm)
   {
+    rtc.clearAlarm(2);
     Serial.println("Checking alarm...");
-    DateTime now = rtc.now();
-    if (now >= currentAlarm)
+    if (alarmMode == AlarmMode::ALARM_SET || alarmMode == AlarmMode::ALARM_SNOOZED)
     {
-      xTaskCreatePinnedToCore(
-        triggerAlarm,          // Task function
-        "BeepTask",       // Name of the task
-        2048,             // Stack size (in bytes)
-        NULL,             // Task input parameter
-        1,                // Priority of the task
-        &BeepTaskHandle,  // Task handle
-        0                 // Core where the task should run (0 for core 0)
-      );
+      DateTime now = rtc.now();
+      Serial.printf("Current alarm time: %02d:%02d\n", currentAlarm.hour(), currentAlarm.minute());
+      Serial.printf("Current time: %02d:%02d\n", now.hour(), now.minute());
+      int nowMinutes = now.hour() * 60 + now.minute();
+      int currentAlarmMinutes = currentAlarm.hour() * 60 + currentAlarm.minute();
+
+      Serial.printf("Now minutes: %d, Alarm minutes: %d\n", nowMinutes, currentAlarmMinutes);
+      int difference = nowMinutes - currentAlarmMinutes;
+      if (difference >= 0 && difference < 2)
+      {
+        Serial.println("Alarm time reached! Should beep!");
+        xTaskCreatePinnedToCore(
+          triggerAlarm,          // Task function
+          "BeepTask",       // Name of the task
+          2048,             // Stack size (in bytes)
+          NULL,             // Task input parameter
+          1,                // Priority of the task
+          &BeepTaskHandle,  // Task handle
+          0                 // Core where the task should run (0 for core 0)
+        );
+      }
     }
   }
   shouldCheckAlarm = false;
@@ -598,13 +622,15 @@ void loop()
 
   checkShake();
 
-  handleEncoderEvents();
+  checkEncoders();
 
   unsigned long currentMillis = millis();
 
   if (nextUpdate != -1 && currentMillis >= nextUpdate)
   {
-    renderScreen();
+    Serial.println("Rendering screen...");
+    Serial.printf("currentMillis: %lu, nextUpdate: %lu\n", currentMillis, nextUpdate);
     nextUpdate = -1;
+    renderScreen();
   }
 }
