@@ -184,7 +184,6 @@ void onEncoderTurn(bool isA, int delta) {
   eventBuffer.push(e);
 }
 
-// HandlingMode handlingMode = HandlingMode::MODE_DRAWING;
 HandlingMode handlingMode = HandlingMode::MODE_DRAWING;
 
 void drawBitmapToBuffer(uint8_t *buffer, int bufWidth, int bufHeight, const uint8_t *bitmap, int x, int y, int w, int h)
@@ -281,9 +280,9 @@ void updateTime(int dHours, int dMinutes)
   markDirty(0);
 }
 
-void updateAlarm(int dHours, int dMinutes)
+void setAlarm(DateTime newAlarmTime)
 {
-  currentAlarm = currentAlarm + TimeSpan(0, dHours, dMinutes, 0);
+  currentAlarm = newAlarmTime;
 
   alarmMode = AlarmMode::ALARM_SET;
 
@@ -395,9 +394,11 @@ void checkEncoders()
       if (success)
       {
         if (event.isEncoderA) {
-          updateAlarm(event.delta, 0);
+          DateTime newTime = currentAlarm + TimeSpan(0, event.delta, 0, 0);
+          setAlarm(newTime);
         } else {
-          updateAlarm(0, event.delta);
+          DateTime newTime = currentAlarm + TimeSpan(0, 0, event.delta, 0);
+          setAlarm(newTime);
         }
       }
     }
@@ -446,8 +447,10 @@ void setup()
   attachInterrupt(digitalPinToInterrupt(RTC_INT_PIN), onAlarm, FALLING);
 
   clockTime = rtc.now();
-  currentAlarm = rtc.now();
-  updateAlarm(0, 1);
+  // DateTime am10 = DateTime(0, 0, 0, 10, 0, 0);
+  DateTime am10 = DateTime(rtc.now().year(), rtc.now().month(), rtc.now().day(), 10, 0, 0);
+  currentAlarm = am10;
+  setAlarm(am10);
 
   if (rtc.lostPower())
   {
@@ -605,9 +608,12 @@ void checkAlarm()
       DateTime currentAlarmPlusSnooze = currentAlarm + TimeSpan(0, 0, snoozeAmount * snoozeCount, 0);
       int nowMinutes = now.hour() * 60 + now.minute();
       int currentAlarmMinutes = currentAlarmPlusSnooze.hour() * 60 + currentAlarmPlusSnooze.minute();
+      printf("Now: %02d:%02d (%d minutes), Alarm: %02d:%02d (%d minutes)\n", now.hour(), now.minute(), nowMinutes, currentAlarmPlusSnooze.hour(), currentAlarmPlusSnooze.minute(), currentAlarmMinutes);
 
-      int difference = nowMinutes - currentAlarmMinutes;
-      if (difference >= 0 && difference < 2)
+      // int difference = nowMinutes - currentAlarmMinutes;
+
+      // if (difference >= 0 && difference < 2)
+      if (nowMinutes == currentAlarmMinutes && BeepTaskHandle == NULL)
       {
         Serial.println("Alarm time reached! Should beep!");
         xTaskCreatePinnedToCore(
